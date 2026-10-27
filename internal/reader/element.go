@@ -9,6 +9,7 @@ package reader
 import (
 	"bytes"
 	"encoding/xml"
+	"strings"
 )
 
 // Element represents a generic XML element with nested children.
@@ -54,6 +55,12 @@ func parseElement(dec *xml.Decoder, start xml.StartElement, startOffset int) (*E
 		ContentStartOffset: int(dec.InputOffset()),
 	}
 
+	// Every character data node, including whitespace-only ones. Between
+	// child elements whitespace is only indentation, but in an element
+	// without children, such as <w:t xml:space="preserve"> </w:t>, it is the
+	// content itself.
+	var allText strings.Builder
+
 	for {
 		tokenStart := int(dec.InputOffset())
 		tok, err := dec.Token()
@@ -70,12 +77,17 @@ func parseElement(dec *xml.Decoder, start xml.StartElement, startOffset int) (*E
 			elem.addChild(child)
 		case xml.EndElement:
 			if t.Name.Local == start.Name.Local && t.Name.Space == start.Name.Space {
+				if len(elem.Children) == 0 {
+					elem.Text = allText.String()
+				}
 				elem.ContentEndOffset = tokenStart
 				elem.EndOffset = int(dec.InputOffset())
 				return elem, nil
 			}
 		case xml.CharData:
-			// Preserve meaningful text; ignore nodes that are entirely whitespace.
+			allText.Write(t)
+			// Preserve meaningful text; ignore nodes that are entirely whitespace
+			// (a leaf element keeps them, see allText).
 			if len(bytes.TrimSpace([]byte(t))) == 0 {
 				continue
 			}
