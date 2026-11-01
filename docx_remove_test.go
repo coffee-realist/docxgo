@@ -63,6 +63,25 @@ func reopen(t *testing.T, doc domain.Document) domain.Document {
 	return opened
 }
 
+// openBody opens a document whose document.xml has the given body content.
+func openBody(t *testing.T, body string) domain.Document {
+	t.Helper()
+	documentXML := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>` + body + `</w:body>
+</w:document>`
+
+	var base bytes.Buffer
+	if _, err := NewDocument().WriteTo(&base); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	doc, err := OpenDocumentFromBytes(rewriteZipEntry(t, base.Bytes(), constants.PathDocument, []byte(documentXML)))
+	if err != nil {
+		t.Fatalf("OpenDocumentFromBytes: %v", err)
+	}
+	return doc
+}
+
 func TestRemoveBlock(t *testing.T) {
 	doc := NewDocument()
 	addTextParagraph(t, doc, "A")
@@ -116,40 +135,49 @@ func TestRemoveBlockErrors(t *testing.T) {
 	}
 }
 
-// A paragraph whose pPr carries a mid-document sectPr can be removed
-// without losing the section break.
+// A paragraph with text whose pPr carries a mid-document sectPr, as Word
+// writes it, can be removed without losing the section break.
 func TestRemoveBlockKeepsEmbeddedSectionBreak(t *testing.T) {
-	doc := NewDocument()
-	addTextParagraph(t, doc, "A")
-	addTextParagraph(t, doc, "carrier")
-	sec, err := doc.AddSectionWithBreak(domain.SectionBreakTypeNextPage)
-	if err != nil {
-		t.Fatalf("AddSectionWithBreak: %v", err)
+	const (
+		landscape = `<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/></w:sectPr>`
+		paraB     = `<w:p w:rsidR="00CD34EF"><w:r><w:t>B</w:t></w:r></w:p>`
+	)
+	doc := openBody(t, `
+<w:p><w:r><w:t>A</w:t></w:r></w:p>
+<w:p><w:pPr>`+landscape+`</w:pPr><w:r><w:t>carrier</w:t></w:r></w:p>
+`+paraB+`
+<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>
+`)
+	if got, want := blockTexts(doc), []string{"A", "carrier", "<section>", "B"}; !slices.Equal(got, want) {
+		t.Fatalf("blocks = %q, want %q", got, want)
 	}
-	if err = sec.SetOrientation(domain.OrientationLandscape); err != nil {
-		t.Fatalf("SetOrientation: %v", err)
-	}
-	addTextParagraph(t, doc, "B")
-
-	opened := reopen(t, doc)
-	idx := slices.Index(blockTexts(opened), "carrier")
-	if idx < 0 {
-		t.Fatalf("carrier paragraph not found in %q", blockTexts(opened))
-	}
-	if err = opened.RemoveBlock(idx); err != nil {
-		t.Fatalf("RemoveBlock(%d): %v", idx, err)
+	if err := doc.RemoveBlock(1); err != nil { // "carrier"
+		t.Fatalf("RemoveBlock(1): %v", err)
 	}
 
-	again := reopen(t, opened)
-	if slices.Contains(blockTexts(again), "carrier") {
-		t.Error("carrier text survived")
+	written := readZipPart(t, doc, constants.PathDocument)
+	if strings.Contains(written, "carrier") {
+		t.Errorf("carrier text survived the save:\n%s", written)
+	}
+	for _, kept := range []string{landscape, paraB} {
+		if !strings.Contains(written, kept) {
+			t.Errorf("%s was not written back as it was:\n%s", kept, written)
+		}
+	}
+
+	again := reopen(t, doc)
+	if got, want := blockTexts(again), []string{"A", "<section>", "B"}; !slices.Equal(got, want) {
+		t.Errorf("blocks after save = %q, want %q", got, want)
 	}
 	sections := again.Sections()
 	if len(sections) != 2 {
 		t.Fatalf("sections = %d, want 2", len(sections))
 	}
-	if o := sections[1].Orientation(); o != domain.OrientationLandscape {
-		t.Errorf("second section orientation = %v, want landscape", o)
+	if o := sections[0].Orientation(); o != domain.OrientationLandscape {
+		t.Errorf("first section orientation = %v, want landscape", o)
+	}
+	if o := sections[1].Orientation(); o == domain.OrientationLandscape {
+		t.Error("second section orientation = landscape, want portrait")
 	}
 }
 
@@ -157,26 +185,14 @@ func TestRemoveBlockKeepsEmbeddedSectionBreak(t *testing.T) {
 // ends in it lose their unmatched halves on save. A balanced bookmark in a
 // kept paragraph and an untouched paragraph are written back as they were.
 func TestRemoveBlockDropsUnmatchedRangeHalves(t *testing.T) {
-	const documentXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:body>
+	doc := openBody(t, `
 <w:p><w:commentRangeStart w:id="2"/><w:bookmarkStart w:id="3" w:name="Kept"/><w:r><w:t>A</w:t></w:r><w:bookmarkEnd w:id="3"/></w:p>
 <w:p><w:bookmarkStart w:id="1" w:name="Spans"/><w:r><w:t>B</w:t></w:r><w:commentRangeEnd w:id="2"/></w:p>
 <w:p><w:r><w:t>C</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p>
 <w:p w:rsidR="00AB12CD"><w:r><w:t>D</w:t></w:r></w:p>
 <w:sectPr/>
-</w:body>
-</w:document>`
-
-	var base bytes.Buffer
-	if _, err := NewDocument().WriteTo(&base); err != nil {
-		t.Fatalf("WriteTo: %v", err)
-	}
-	doc, err := OpenDocumentFromBytes(rewriteZipEntry(t, base.Bytes(), constants.PathDocument, []byte(documentXML)))
-	if err != nil {
-		t.Fatalf("OpenDocumentFromBytes: %v", err)
-	}
-	if err = doc.RemoveBlock(1); err != nil { // "B"
+`)
+	if err := doc.RemoveBlock(1); err != nil { // "B"
 		t.Fatalf("RemoveBlock(1): %v", err)
 	}
 
