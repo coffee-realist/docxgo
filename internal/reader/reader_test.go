@@ -438,24 +438,37 @@ func TestDocumentNamespacesRetainsOriginalPrefixBindings(t *testing.T) {
 	}
 }
 
-// Whitespace between child elements is indentation and stays out of Text,
-// but in an element without children it is the content itself.
-func TestParseXMLTreeKeepsWhitespaceOnlyTextOfLeafElements(t *testing.T) {
-	tree, err := parseXMLTree([]byte(`<w:r xmlns:w="` + constants.NamespaceMain + `">
-  <w:t xml:space="preserve"> </w:t>
-</w:r>`))
-	if err != nil {
-		t.Fatalf("parseXMLTree: %v", err)
+// Whitespace between child elements is indentation and stays out of Text.
+// In an element without children it is the content itself when
+// xml:space="preserve" applies, set on the element or inherited, and is not
+// significant otherwise. A no-break space is not XML whitespace.
+func TestParseXMLTreeWhitespaceOnlyTextOfLeafElements(t *testing.T) {
+	tests := []struct {
+		name, runAttr, text, want string
+	}{
+		{name: "preserve", text: `<w:t xml:space="preserve"> </w:t>`, want: " "},
+		{name: "no preserve", text: `<w:t> </w:t>`, want: ""},
+		{name: "inherited preserve", runAttr: ` xml:space="preserve"`, text: `<w:t> </w:t>`, want: " "},
+		{name: "overridden preserve", runAttr: ` xml:space="preserve"`, text: `<w:t xml:space="default"> </w:t>`, want: ""},
+		{name: "no-break space", text: "<w:t> </w:t>", want: " "},
 	}
-	if tree.Text != "" {
-		t.Errorf("w:r Text = %q, want indentation ignored", tree.Text)
-	}
-	text := findChild(tree, "t")
-	if text == nil {
-		t.Fatal("w:t not found")
-	}
-	if text.Text != " " {
-		t.Errorf("w:t Text = %q, want %q", text.Text, " ")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tree, err := parseXMLTree([]byte(`<w:r xmlns:w="` + constants.NamespaceMain + `"` + tt.runAttr + ">\n  " + tt.text + "\n</w:r>"))
+			if err != nil {
+				t.Fatalf("parseXMLTree: %v", err)
+			}
+			if tree.Text != "" {
+				t.Errorf("w:r Text = %q, want indentation ignored", tree.Text)
+			}
+			text := findChild(tree, "t")
+			if text == nil {
+				t.Fatal("w:t not found")
+			}
+			if text.Text != tt.want {
+				t.Errorf("w:t Text = %q, want %q", text.Text, tt.want)
+			}
+		})
 	}
 }
 
@@ -2577,6 +2590,27 @@ func TestReconstructRunWithWhitespaceOnlyTextSurvivesEdit(t *testing.T) {
 		if written := documentXML(t, buf.Bytes()); !strings.Contains(written, ">"+space+"</w:t>") {
 			t.Errorf("%q: edited paragraph lost the space run:\n%s", space, written)
 		}
+	}
+}
+
+// Without xml:space="preserve" a whitespace-only w:t is not significant and
+// Word does not show it, so editing the paragraph must not make it visible.
+func TestReconstructRunWithInsignificantWhitespaceStaysHidden(t *testing.T) {
+	doc := reconstructFromBookmarkBody(t, `<w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t> </w:t></w:r><w:r><w:t>world</w:t></w:r></w:p>`)
+
+	para := doc.Paragraphs()[0]
+	if got, want := para.Text(), "Helloworld"; got != want {
+		t.Fatalf("Text() = %q, want %q", got, want)
+	}
+	if err := para.SetAlignment(domain.AlignmentCenter); err != nil {
+		t.Fatalf("SetAlignment: %v", err)
+	}
+	var buf bytes.Buffer
+	if _, err := doc.WriteTo(&buf); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if written := documentXML(t, buf.Bytes()); strings.Contains(written, "> </w:t>") {
+		t.Errorf("edited paragraph made the space visible:\n%s", written)
 	}
 }
 
